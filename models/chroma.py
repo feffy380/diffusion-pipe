@@ -416,7 +416,10 @@ class TransformerWrapper(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        img, txt, pe, mod_vectors, txt_img_mask = inputs
+        tread_start = 2
+        img, txt, pe, mod_vectors, txt_img_mask, *rest = inputs
+        if self.idx > tread_start:
+            indices_processed, indices_routed, img_routed, pe_original, txt_img_mask_original = rest
 
         self.offloader.wait_for_block(self.idx)
 
@@ -439,19 +442,50 @@ class TransformerWrapper(nn.Module):
             for spec in txt_mod_spec
         ]
         double_mod = [img_mod, txt_mod]
+
+        # TREAD route start
+        if self.idx == tread_start:
+            # select routed indices
+            seq_len = img.shape[1]
+            num_routed = int(seq_len * 0.5)
+            routed_indices = torch.randperm(seq_len, device=img.device)[:num_routed]
+            processed_mask = torch.ones(seq_len, dtype=torch.bool, device=img.device)
+            processed_mask[routed_indices] = False
+            combined_mask = torch.cat((
+                torch.ones(txt.shape[1], dtype=torch.bool, device=txt.device),
+                processed_mask,
+            ))
+
+            # separate routed tokens
+            img_routed = img[:, routed_indices, :]
+            img = img[:, processed_mask, :]
+            pe_original = pe
+            pe = pe[:, :, combined_mask, ...]
+
+            # indices for reconstruction
+            indices_processed = torch.nonzero(processed_mask, as_tuple=False).squeeze(-1)
+            indices_routed = routed_indices
+
+            # shrink attention mask
+            txt_img_mask_original = txt_img_mask
+            txt_img_mask = txt_img_mask[..., combined_mask, :][..., :, combined_mask]
+
         img, txt = self.block(
             img=img, txt=txt, pe=pe, distill_vec=double_mod, mask=txt_img_mask
         )
 
         self.offloader.submit_move_blocks_forward(self.idx)
 
-        return make_contiguous(img, txt, pe, mod_vectors, txt_img_mask)
+        if self.idx >= tread_start:
+            return make_contiguous(img, txt, pe, mod_vectors, txt_img_mask, indices_processed, indices_routed, img_routed, pe_original, txt_img_mask_original)
+        else:
+            return make_contiguous(img, txt, pe, mod_vectors, txt_img_mask)
 
 
 def concatenate_hidden_states(inputs):
-    img, txt, pe, mod_vectors, txt_img_mask = inputs
+    img, txt, pe, mod_vectors, txt_img_mask, indices_processed, indices_routed, img_routed, pe_original, txt_img_mask_original = inputs
     img = torch.cat((txt, img), 1)
-    return img, txt, pe, mod_vectors, txt_img_mask
+    return img, txt, pe, mod_vectors, txt_img_mask, indices_processed, indices_routed, img_routed, pe_original, txt_img_mask_original
 
 
 class SingleTransformerWrapper(nn.Module):
@@ -463,7 +497,10 @@ class SingleTransformerWrapper(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        img, txt, pe, mod_vectors, txt_img_mask = inputs
+        tread_end = 38 - 4
+        img, txt, pe, mod_vectors, txt_img_mask, *rest = inputs
+        if self.idx <= tread_end:
+            indices_processed, indices_routed, img_routed, pe_original, txt_img_mask_original = rest
 
         self.offloader.wait_for_block(self.idx)
 
@@ -475,9 +512,27 @@ class SingleTransformerWrapper(nn.Module):
         )
         img = self.block(img, pe=pe, distill_vec=single_mod, mask=txt_img_mask)
 
+        # TREAD route end
+        if self.idx == tread_end:
+            # reconstruct sequence
+            img_processed = img[:, txt.shape[1]:, :]
+            batch, _, dim = img.shape
+            seq_len = indices_processed.numel() + indices_routed.numel()
+
+            full_img = torch.empty(batch, seq_len, dim, device=img.device, dtype=img.dtype)
+            full_img[:, indices_processed, :] = img_processed
+            full_img[:, indices_routed, :] = img_routed
+
+            img = torch.cat((img[:, :txt.shape[1], :], full_img), dim=1)
+            pe = pe_original
+            txt_img_mask = txt_img_mask_original
+
         self.offloader.submit_move_blocks_forward(self.idx)
 
-        return make_contiguous(img, txt, pe, mod_vectors, txt_img_mask)
+        if self.idx < tread_end:
+            return make_contiguous(img, txt, pe, mod_vectors, txt_img_mask, indices_processed, indices_routed, img_routed, pe_original, txt_img_mask_original)
+        else:
+            return make_contiguous(img, txt, pe, mod_vectors, txt_img_mask)
 
 
 class FinalLayer(nn.Module):
