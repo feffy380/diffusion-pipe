@@ -419,9 +419,7 @@ class TransformerWrapper(nn.Module):
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
         tread_start = 2
-        img, txt, pe, mod_vectors, txt_img_mask, *rest = inputs
-        if self.tread_ratio and self.idx > tread_start:
-            indices_processed, indices_routed, img_routed, pe_original, txt_img_mask_original = rest
+        img, txt, pe, mod_vectors, txt_img_mask, *tread = inputs
 
         self.offloader.wait_for_block(self.idx)
 
@@ -472,16 +470,15 @@ class TransformerWrapper(nn.Module):
             txt_img_mask_original = txt_img_mask
             txt_img_mask = txt_img_mask[..., combined_mask, :][..., :, combined_mask]
 
+            tread = [indices_processed, indices_routed, img_routed, pe_original, txt_img_mask_original]
+
         img, txt = self.block(
             img=img, txt=txt, pe=pe, distill_vec=double_mod, mask=txt_img_mask
         )
 
         self.offloader.submit_move_blocks_forward(self.idx)
 
-        if self.tread_ratio and self.idx >= tread_start:
-            return make_contiguous(img, txt, pe, mod_vectors, txt_img_mask, indices_processed, indices_routed, img_routed, pe_original, txt_img_mask_original)
-        else:
-            return make_contiguous(img, txt, pe, mod_vectors, txt_img_mask)
+        return make_contiguous(img, txt, pe, mod_vectors, txt_img_mask, *tread)
 
 
 def concatenate_hidden_states(inputs):
@@ -501,9 +498,7 @@ class SingleTransformerWrapper(nn.Module):
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
         tread_end = 38 - 4
-        img, txt, pe, mod_vectors, txt_img_mask, *rest = inputs
-        if self.tread_ratio and self.idx <= tread_end:
-            indices_processed, indices_routed, img_routed, pe_original, txt_img_mask_original = rest
+        img, txt, pe, mod_vectors, txt_img_mask, *tread = inputs
 
         self.offloader.wait_for_block(self.idx)
 
@@ -517,6 +512,8 @@ class SingleTransformerWrapper(nn.Module):
 
         # TREAD route end
         if self.tread_ratio and self.idx == tread_end:
+            indices_processed, indices_routed, img_routed, pe_original, txt_img_mask_original = tread
+
             # reconstruct sequence
             img_processed = img[:, txt.shape[1]:, :]
             batch, _, dim = img.shape
@@ -529,13 +526,11 @@ class SingleTransformerWrapper(nn.Module):
             img = torch.cat((img[:, :txt.shape[1], :], full_img), dim=1)
             pe = pe_original
             txt_img_mask = txt_img_mask_original
+            tread = []
 
         self.offloader.submit_move_blocks_forward(self.idx)
 
-        if self.tread_ratio and self.idx < tread_end:
-            return make_contiguous(img, txt, pe, mod_vectors, txt_img_mask, indices_processed, indices_routed, img_routed, pe_original, txt_img_mask_original)
-        else:
-            return make_contiguous(img, txt, pe, mod_vectors, txt_img_mask)
+        return make_contiguous(img, txt, pe, mod_vectors, txt_img_mask, *tread)
 
 
 class FinalLayer(nn.Module):
